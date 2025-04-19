@@ -4,6 +4,7 @@ Models.
 
 import numpy as np
 import torch
+import mamba
 from torch import nn
 from transformers import BertConfig, BertModel, GPT2Config, GPT2Model
 
@@ -267,3 +268,206 @@ class GPT4Rec(nn.Module):
             outputs = self.head(outputs)
 
         return outputs
+
+
+class MAMBA4Rec(nn.Module):
+    def __init__(self, config: dict):
+        """
+        config keys:
+          - n_items    : int, number of unique items
+          - user_id    : int, your special separator ID
+          - hidden_size, num_layers, dropout_prob,
+            d_state, d_conv, expand, loss_type ("BPR" or "CE")
+        """
+        super().__init__()
+        self.n_items      = config["n_items"]
+        self.user_id      = config["user_id"]
+        self.hidden_size  = config["hidden_size"]
+        self.num_layers   = config["num_layers"]
+        self.dropout_prob = config["dropout_prob"]
+        self.d_state      = config["d_state"]
+        self.d_conv       = config["d_conv"]
+        self.expand       = config["expand"]
+        self.loss_type    = config.get("loss_type", "BPR")
+
+        # ---- embeddings & norm/dropout ----
+        # we reserve indices [0..n_items-1] for real items, and
+        # use negatives of user_id to index into the upper half of the embedding table
+        total_embs = int(self.n_items * 1.5)
+        self.item_emb = nn.Embedding(total_embs, self.hidden_size, padding_idx=0)
+        self.layer_norm = nn.LayerNorm(self.hidden_size, eps=1e-12)
+        self.dropout    = nn.Dropout(self.dropout_prob)
+
+        # ---- mamba layers ----
+        self.layers = nn.ModuleList([
+            MambaLayer(
+                d_model=self.hidden_size,
+                d_state=self.d_state,
+                d_conv=self.d_conv,
+                expand=self.expand,
+                dropout=self.dropout_prob,
+                use_residual=(self.num_layers > 1)
+            )
+            for _ in range(self.num_layers)
+        ])
+
+        # ---- loss ----
+        if self.loss_type == "BPR":
+            self.loss_fn = BPRLoss()
+        elif self.loss_type == "CE":
+            self.loss_fn = nn.CrossEntropyLoss()
+        else:
+            raise ValueError("loss_type must be 'BPR' or 'CE'")
+
+        # ---- initialize ----
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(0.0, 0.02)
+        if isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
+
+    def _interleave_user(self, seq: torch.LongTensor) -> torch.LongTensor:
+        """
+        Given seq of shape [B, L], produce [B, L + L//2] by inserting
+        a -user_id token after every 2 items.
+        """
+        B, L = seq.size()
+        new_L = L + (L // 2)
+        out = seq.new_zeros((B, new_L))
+        for i in range(L):
+            pos = i + (i // 2)
+            out[:, pos] = seq[:, i]
+            if (i + 1) % 2 == 0:
+                out[:, pos + 1] = -self.user_id
+        return out.long()
+
+    def _gather_last(self, h: torch.Tensor, lengths: torch.LongTensor) -> torch.Tensor:
+        """
+        h: [B, T, D], lengths: [B] true lengths before padding
+        returns: [B, D] embeddings at positions lengths-1
+        """
+        B, T, D = h.size()
+        idx = (lengths - 1).clamp(min=0, max=T-1)
+        idx = idx.unsqueeze(1).unsqueeze(2).expand(-1, 1, D)
+        return h.gather(1, idx).squeeze(1)
+
+    def forward(self, item_seq: torch.LongTensor, seq_len: torch.LongTensor) -> torch.Tensor:
+        """
+        item_seq: [B, L]
+        seq_len : [B]
+        -> returns: [B, hidden_size]
+        """
+        total_seq     = self._interleave_user(item_seq)
+        total_lengths = seq_len + (seq_len // 2)
+
+        h = self.item_emb(total_seq)
+        h = self.dropout(h)
+        h = self.layer_norm(h)
+
+        for layer in self.layers:
+            h = layer(h)
+
+        # gather the representation at the 'last' real-item position
+        return self._gather_last(h, total_lengths)
+
+    def calculate_loss(
+        self,
+        item_seq: torch.LongTensor,
+        seq_len: torch.LongTensor,
+        pos_items: torch.LongTensor,
+        neg_items: torch.LongTensor = None
+    ) -> torch.Tensor:
+        h = self.forward(item_seq, seq_len)
+
+        if self.loss_type == "BPR":
+            pos_h = self.item_emb(pos_items)
+            neg_h = self.item_emb(neg_items)
+            pos_score = (h * pos_h).sum(-1)
+            neg_score = (h * neg_h).sum(-1)
+            return self.loss_fn(pos_score, neg_score)
+
+        # CE over all items
+        logits = h @ self.item_emb.weight.t()
+        return self.loss_fn(logits, pos_items)
+
+    def predict(
+        self,
+        item_seq: torch.LongTensor,
+        seq_len: torch.LongTensor,
+        test_items: torch.LongTensor
+    ) -> torch.Tensor:
+        h = self.forward(item_seq, seq_len)
+        t = self.item_emb(test_items)
+        return (h * t).sum(-1)
+
+    def full_sort_predict(
+        self,
+        item_seq: torch.LongTensor,
+        seq_len: torch.LongTensor
+    ) -> torch.Tensor:
+        h = self.forward(item_seq, seq_len)
+        return h @ self.item_emb.weight.t()
+
+class BPRLoss(nn.Module):
+    """Bayesian Personalized Ranking loss: -log σ(pos_score - neg_score)"""
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pos_score: torch.Tensor, neg_score: torch.Tensor) -> torch.Tensor:
+        diff = pos_score - neg_score
+        return -torch.mean(torch.log(torch.sigmoid(diff) + 1e-8))
+
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model: int, inner_size: int, dropout: float = 0.2):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, inner_size)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(inner_size, d_model)
+        self.norm = nn.LayerNorm(d_model, eps=1e-12)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.fc1(x)
+        h = self.act(h)
+        h = self.dropout(h)
+        h = self.fc2(h)
+        h = self.dropout(h)
+        # residual + norm
+        return self.norm(h + x)
+
+
+class MambaLayer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int,
+        d_conv: int,
+        expand: int,
+        dropout: float,
+        use_residual: bool = True
+    ):
+        super().__init__()
+        self.mamba = Mamba(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model, eps=1e-12)
+        self.ffn = FeedForward(d_model, inner_size=d_model * 4, dropout=dropout)
+        self.use_residual = use_residual
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.mamba(x)
+        if self.use_residual:
+            h = self.norm(self.dropout(h) + x)
+        else:
+            h = self.norm(self.dropout(h))
+        return self.ffn(h)

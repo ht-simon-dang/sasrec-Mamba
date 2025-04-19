@@ -20,7 +20,7 @@ from datasets import (CausalLMDataset, CausalLMPredictionDataset,
                       MaskedLMDataset, MaskedLMPredictionDataset,
                       PaddingCollateFn)
 from metrics import compute_metrics, compute_sampled_metrics
-from models import RNN, BERT4Rec, SASRec
+from models import RNN, BERT4Rec, SASRec, MAMBA4Rec, GPT4Rec
 from modules import SeqRec, SeqRecWithSampling
 from postprocess import preds2recs
 from preprocess import add_time_idx
@@ -89,7 +89,7 @@ def create_dataloaders(train, validation, config):
         validation_users = np.random.choice(validation_users, size=validation_size, replace=False)
         validation = validation[validation.user_id.isin(validation_users)]
 
-    if config.model in ['SASRec', 'GPT4Rec', 'RNN']:
+    if config.model in ['SASRec', 'GPT4Rec', 'RNN', 'MAMBA4Rec']:
         train_dataset = CausalLMDataset(train, **config['dataset'])
         eval_dataset = CausalLMPredictionDataset(
             validation, max_length=config.dataset.max_length, validation_mode=True)
@@ -125,6 +125,9 @@ def create_model(config, item_count):
                         gpt_config=config.model_params)
     elif config.model == 'RNN':
         model = RNN(vocab_size=item_count + 1, add_head=add_head,
+                    rnn_config=config.model_params)
+    elif config.model == 'MAMBA4Rec':
+        model = MAMBA4Rec(vocab_size=int(item_count * 1.5) + 1, add_head=add_head,
                     rnn_config=config.model_params)
 
     return model
