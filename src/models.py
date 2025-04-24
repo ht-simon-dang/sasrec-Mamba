@@ -269,149 +269,68 @@ class GPT4Rec(nn.Module):
 
         return outputs
 
+class MambaRec(nn.Module):
+    def __init__(self, item_num, maxlen=128, hidden_units=64, num_blocks=1, 
+                 d_state=32, d_conv=4, expand=2, dropout_rate=0.1, 
+                 initializer_range=0.02, add_head=True):
+        super(MambaRec, self).__init__()
+        self.item_num = item_num
+        self.maxlen = maxlen
+        self.hidden_units = hidden_units
+        self.num_blocks = num_blocks
+        self.dropout_rate = dropout_rate
+        self.initializer_range = initializer_range
+        self.add_head = add_head
 
-class MAMBA4Rec(nn.Module):
-    def __init__(self, config: dict):
-        """
-        config keys:
-          - n_items    : int, number of unique items
-          - user_id    : int, your special separator ID
-          - hidden_size, num_layers, dropout_prob,
-            d_state, d_conv, expand, loss_type ("BPR" or "CE")
-        """
-        super().__init__()
-        self.n_items      = config["n_items"]
-        self.user_id      = config["user_id"]
-        self.hidden_size  = config["hidden_size"]
-        self.num_layers   = config["num_layers"]
-        self.dropout_prob = config["dropout_prob"]
-        self.d_state      = config["d_state"]
-        self.d_conv       = config["d_conv"]
-        self.expand       = config["expand"]
-        self.loss_type    = config.get("loss_type", "BPR")
+        # Embedding layers for items and positions (padding_idx=0 for no-item)
+        self.item_emb = nn.Embedding(item_num + 1, hidden_units, padding_idx=0)
+        self.pos_emb = nn.Embedding(maxlen, hidden_units)
+        self.emb_dropout = nn.Dropout(p=dropout_rate)
 
-        # ---- embeddings & norm/dropout ----
-        # we reserve indices [0..n_items-1] for real items, and
-        # use negatives of user_id to index into the upper half of the embedding table
-        total_embs = int(self.n_items * 1.5)
-        self.item_emb = nn.Embedding(total_embs, self.hidden_size, padding_idx=0)
-        self.layer_norm = nn.LayerNorm(self.hidden_size, eps=1e-12)
-        self.dropout    = nn.Dropout(self.dropout_prob)
-
-        # ---- mamba layers ----
-        self.layers = nn.ModuleList([
-            MambaLayer(
-                d_model=self.hidden_size,
-                d_state=self.d_state,
-                d_conv=self.d_conv,
-                expand=self.expand,
-                dropout=self.dropout_prob,
-                use_residual=(self.num_layers > 1)
-            )
-            for _ in range(self.num_layers)
+        # Initialize one or more Mamba SSM blocks
+        self.mamba_layers = nn.ModuleList([
+            Mamba(d_model=hidden_units, d_state=d_state, d_conv=d_conv, expand=expand)
+            for _ in range(num_blocks)
         ])
 
-        # ---- loss ----
-        if self.loss_type == "BPR":
-            self.loss_fn = BPRLoss()
-        elif self.loss_type == "CE":
-            self.loss_fn = nn.CrossEntropyLoss()
-        else:
-            raise ValueError("loss_type must be 'BPR' or 'CE'")
-
-        # ---- initialize ----
+        # (Optional) initialize weights similarly to SASRec
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(0.0, 0.02)
-        if isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
+        """Initialize weights with normal distribution, zero-out padding embeddings."""
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
 
-    def _interleave_user(self, seq: torch.LongTensor) -> torch.LongTensor:
-        """
-        Given seq of shape [B, L], produce [B, L + L//2] by inserting
-        a -user_id token after every 2 items.
-        """
-        B, L = seq.size()
-        new_L = L + (L // 2)
-        out = seq.new_zeros((B, new_L))
-        for i in range(L):
-            pos = i + (i // 2)
-            out[:, pos] = seq[:, i]
-            if (i + 1) % 2 == 0:
-                out[:, pos + 1] = -self.user_id
-        return out.long()
+    def forward(self, input_ids, attention_mask=None):
+        # Input: input_ids [B, T], where 0 indicates padding.
+        # Get item embeddings and add positional embeddings
+        seqs = self.item_emb(input_ids)                          # [B, T, D]
+        seqs *= self.item_emb.embedding_dim ** 0.5               # scale by sqrt(D)
+        # Create position indices 0..T-1 for each sequence in the batch
+        positions = torch.arange(seqs.size(1), device=seqs.device).unsqueeze(0).expand_as(input_ids)
+        seqs += self.pos_emb(positions)                          # add positional encoding
+        seqs = self.emb_dropout(seqs)
+        # Mask out padded positions to zero (so they don't contribute)
+        pad_mask = (input_ids == 0)                              # [B, T] bool
+        if pad_mask.any():
+            seqs = seqs.masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
-    def _gather_last(self, h: torch.Tensor, lengths: torch.LongTensor) -> torch.Tensor:
-        """
-        h: [B, T, D], lengths: [B] true lengths before padding
-        returns: [B, D] embeddings at positions lengths-1
-        """
-        B, T, D = h.size()
-        idx = (lengths - 1).clamp(min=0, max=T-1)
-        idx = idx.unsqueeze(1).unsqueeze(2).expand(-1, 1, D)
-        return h.gather(1, idx).squeeze(1)
+        # Pass through Mamba SSM layers (selective state-space modeling)
+        for mamba_block in self.mamba_layers:
+            seqs = mamba_block(seqs)  # each block returns [B, T, D] same shape&#8203;:contentReference[oaicite:4]{index=4}
 
-    def forward(self, item_seq: torch.LongTensor, seq_len: torch.LongTensor) -> torch.Tensor:
-        """
-        item_seq: [B, L]
-        seq_len : [B]
-        -> returns: [B, hidden_size]
-        """
-        total_seq     = self._interleave_user(item_seq)
-        total_lengths = seq_len + (seq_len // 2)
+        outputs = seqs  # [B, T, D] hidden states
+        if self.add_head:
+            # Project hidden states to item scores using item embedding matrix (tying weights)
+            outputs = torch.matmul(outputs, self.item_emb.weight.T)  # [B, T, item_num+1]
+        return outputs
 
-        h = self.item_emb(total_seq)
-        h = self.dropout(h)
-        h = self.layer_norm(h)
-
-        for layer in self.layers:
-            h = layer(h)
-
-        # gather the representation at the 'last' real-item position
-        return self._gather_last(h, total_lengths)
-
-    def calculate_loss(
-        self,
-        item_seq: torch.LongTensor,
-        seq_len: torch.LongTensor,
-        pos_items: torch.LongTensor,
-        neg_items: torch.LongTensor = None
-    ) -> torch.Tensor:
-        h = self.forward(item_seq, seq_len)
-
-        if self.loss_type == "BPR":
-            pos_h = self.item_emb(pos_items)
-            neg_h = self.item_emb(neg_items)
-            pos_score = (h * pos_h).sum(-1)
-            neg_score = (h * neg_h).sum(-1)
-            return self.loss_fn(pos_score, neg_score)
-
-        # CE over all items
-        logits = h @ self.item_emb.weight.t()
-        return self.loss_fn(logits, pos_items)
-
-    def predict(
-        self,
-        item_seq: torch.LongTensor,
-        seq_len: torch.LongTensor,
-        test_items: torch.LongTensor
-    ) -> torch.Tensor:
-        h = self.forward(item_seq, seq_len)
-        t = self.item_emb(test_items)
-        return (h * t).sum(-1)
-
-    def full_sort_predict(
-        self,
-        item_seq: torch.LongTensor,
-        seq_len: torch.LongTensor
-    ) -> torch.Tensor:
-        h = self.forward(item_seq, seq_len)
-        return h @ self.item_emb.weight.t()
 
 class BPRLoss(nn.Module):
     """Bayesian Personalized Ranking loss: -log σ(pos_score - neg_score)"""
