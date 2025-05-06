@@ -1,54 +1,67 @@
 """
-Filter interactions.
+Pre-processing script for recommendation data, including filtering
+and sequence generation with user ID injection.
 """
 
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+
+# --- Filtering Functions (from original script) ---
 
 def add_time_idx(df, user_col='user_id', timestamp_col='timestamp', sort=True):
-    """Add time index to interactions dataframe."""
-
+    """Add time index (0-based) to interactions dataframe."""
     if sort:
+        print(f"Sorting interactions by {user_col} and {timestamp_col}...")
         df = df.sort_values([user_col, timestamp_col])
 
+    print("Adding time indices (time_idx and time_idx_reversed)...")
     df['time_idx'] = df.groupby(user_col).cumcount()
     df['time_idx_reversed'] = df.groupby(user_col).cumcount(ascending=False)
-
+    print("Time indices added.")
     return df
 
+def filter_items(df, item_min_count, user_col='user_id', item_col='item_id'):
+    """Filter out items with fewer than item_min_count interactions."""
+    print(f"Filtering items with less than {item_min_count} interactions...")
+    item_counts = df.groupby(item_col)[user_col].nunique() # Count unique users per item
+    valid_items = item_counts[item_counts >= item_min_count].index
+    n_items_before = df[item_col].nunique()
+    n_interactions_before = len(df)
 
-def filter_items(df, item_min_count, item_col='item_id'):
+    df_filtered = df[df[item_col].isin(valid_items)].copy() # Use .copy() to avoid SettingWithCopyWarning
 
-    print('Filtering items..')
+    n_items_after = df_filtered[item_col].nunique()
+    n_interactions_after = len(df_filtered)
 
-    item_count = df.groupby(item_col).user_id.nunique()
+    print(f"  Items before: {n_items_before}")
+    print(f"  Items after: {n_items_after} (removed {n_items_before - n_items_after})")
+    print(f"  Interactions before: {n_interactions_before}")
+    print(f"  Interactions after: {n_interactions_after} (removed {n_interactions_before - n_interactions_after})")
+    print("Item filtering done.")
+    return df_filtered
 
-    item_ids = item_count[item_count >= item_min_count].index
-    print(f'Number of items before {len(item_count)}')
-    print(f'Number of items after {len(item_ids)}')
+def filter_users(df, user_min_count, user_col='user_id', item_col='item_id'):
+    """Filter out users with fewer than user_min_count interactions."""
+    print(f"Filtering users with less than {user_min_count} interactions...")
+    user_counts = df.groupby(user_col)[item_col].nunique() # Count unique items per user
+    valid_users = user_counts[user_counts >= user_min_count].index
+    n_users_before = df[user_col].nunique()
+    n_interactions_before = len(df)
 
-    print(f'Interactions length before: {len(df)}')
-    df = df[df.item_id.isin(item_ids)]
-    print(f'Interactions length after: {len(df)}')
+    df_filtered = df[df[user_col].isin(valid_users)].copy() # Use .copy() to avoid SettingWithCopyWarning
 
-    return df
+    n_users_after = df_filtered[user_col].nunique()
+    n_interactions_after = len(df_filtered)
 
+    print(f"  Users before: {n_users_before}")
+    print(f"  Users after: {n_users_after} (removed {n_users_before - n_users_after})")
+    print(f"  Interactions before: {n_interactions_before}")
+    print(f"  Interactions after: {n_interactions_after} (removed {n_interactions_before - n_interactions_after})")
+    print("User filtering done.")
+    return df_filtered
 
-def filter_users(df, user_min_count, user_col='user_id'):
-
-    print('Filtering users..')
-
-    user_count = df.groupby(user_col).item_id.nunique()
-
-    user_ids = user_count[user_count >= user_min_count].index
-    print(f'Number of users before {len(user_count)}')
-    print(f'Number of users after {len(user_ids)}')
-
-    print(f'Interactions length before: {len(df)}')
-    df = df[df.user_id.isin(user_ids)]
-    print(f'Interactions length after: {len(df)}')
-
-    return df
-
-
+# --- New Functions for ID Mapping and Sequence Generation ---
 
 def map_ids(df, user_col='user_id', item_col='item_id'):
     """
@@ -206,4 +219,5 @@ if __name__ == '__main__':
              print(f"User 'A' mapped user ID: {user_map.get('A')}")
              print(f"User 'A' mapped item IDs: {[item_map.get(i) for i in interactions_df[interactions_df['user_id'] == 'A']['item_id'].tolist()]}")
              print(f"User 'A' generated sequence: {final_sequences['A']}")
+
 

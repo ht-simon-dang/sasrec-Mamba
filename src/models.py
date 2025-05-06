@@ -269,124 +269,64 @@ class GPT4Rec(nn.Module):
 
         return outputs
 
-class MambaRec(nn.Module):
-    def __init__(self, item_num, maxlen=128, hidden_units=64, num_blocks=1, 
-                 d_state=32, d_conv=4, expand=2, dropout_rate=0.1, 
-                 initializer_range=0.02, add_head=True):
-        super(MambaRec, self).__init__()
-        self.item_num = item_num
-        self.maxlen = maxlen
-        self.hidden_units = hidden_units
-        self.num_blocks = num_blocks
-        self.dropout_rate = dropout_rate
-        self.initializer_range = initializer_range
+class MAMBA4Rec(nn.Module):
+    """
+    Mamba for Sequential Recommendation.
+    """
+    def __init__(self, vocab_size, mamba_config, add_head=True,
+                 tie_weights=True, padding_idx=0, init_std=0.02,
+                 **kwargs):
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.mamba_config = mamba_config
         self.add_head = add_head
+        self.tie_weights = tie_weights
+        self.padding_idx = padding_idx
+        self.init_std = init_std
 
-        # Embedding layers for items and positions (padding_idx=0 for no-item)
-        self.item_emb = nn.Embedding(item_num + 1, hidden_units, padding_idx=0)
-        self.pos_emb = nn.Embedding(maxlen, hidden_units)
-        self.emb_dropout = nn.Dropout(p=dropout_rate)
+        # Ensure d_model is present in the config
+        if 'd_model' not in mamba_config:
+            raise ValueError("mamba_config must contain 'd_model'")
+        self.hidden_size = mamba_config['d_model']
 
-        # Initialize one or more Mamba SSM blocks
-        self.mamba_layers = nn.ModuleList([
-            Mamba(d_model=hidden_units, d_state=d_state, d_conv=d_conv, expand=expand)
-            for _ in range(num_blocks)
-        ])
+        # Item embedding layer
+        self.embed_layer = nn.Embedding(num_embeddings=vocab_size,
+                                        embedding_dim=self.hidden_size,
+                                        padding_idx=padding_idx)
+        
+        self.mamba_model = Mamba(**mamba_config, **kwargs)
 
-        # (Optional) initialize weights similarly to SASRec
-        self.apply(self._init_weights)
+        # Optional output head
+        if self.add_head:
+            self.head = nn.Linear(self.hidden_size, vocab_size, bias=False)
+            if self.tie_weights:
+                # Ensure dimensions match if tying weights
+                if self.head.weight.shape != self.embed_layer.weight.shape:
+                     raise ValueError(f"Head ({self.head.weight.shape}) and Embed ({self.embed_layer.weight.shape}) "
+                                      f"shapes don't match for tied weights.")
+                self.head.weight = self.embed_layer.weight
 
-    def _init_weights(self, module):
-        """Initialize weights with normal distribution, zero-out padding embeddings."""
-        if isinstance(module, (nn.Linear, nn.Conv1d)):
-            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+        # Initialize weights
+        self.init_weights()
+
+    def init_weights(self):
+        self.embed_layer.weight.data.normal_(mean=0.0, std=self.init_std)
+        if self.padding_idx is not None:
+            with torch.no_grad():
+                self.embed_layer.weight.data[self.padding_idx].zero_()
+
+        # Initialize head weights if not tied and head exists
+        if self.add_head and not self.tie_weights:
+             self.head.weight.data.normal_(mean=0.0, std=self.init_std)
 
     def forward(self, input_ids, attention_mask=None):
-        # Input: input_ids [B, T], where 0 indicates padding.
-        # Get item embeddings and add positional embeddings
-        seqs = self.item_emb(input_ids)                          # [B, T, D]
-        seqs *= self.item_emb.embedding_dim ** 0.5               # scale by sqrt(D)
-        # Create position indices 0..T-1 for each sequence in the batch
-        positions = torch.arange(seqs.size(1), device=seqs.device).unsqueeze(0).expand_as(input_ids)
-        seqs += self.pos_emb(positions)                          # add positional encoding
-        seqs = self.emb_dropout(seqs)
-        # Mask out padded positions to zero (so they don't contribute)
-        pad_mask = (input_ids == 0)                              # [B, T] bool
-        if pad_mask.any():
-            seqs = seqs.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        embeds = self.embed_layer(input_ids)
+        mamba_outputs = self.mamba_model(embeds)
+        outputs = mamba_outputs
 
-        # Pass through Mamba SSM layers (selective state-space modeling)
-        for mamba_block in self.mamba_layers:
-            seqs = mamba_block(seqs)  # each block returns [B, T, D] same shape&#8203;:contentReference[oaicite:4]{index=4}
-
-        outputs = seqs  # [B, T, D] hidden states
         if self.add_head:
-            # Project hidden states to item scores using item embedding matrix (tying weights)
-            outputs = torch.matmul(outputs, self.item_emb.weight.T)  # [B, T, item_num+1]
+            outputs = self.head(outputs)
+
         return outputs
 
-
-class BPRLoss(nn.Module):
-    """Bayesian Personalized Ranking loss: -log σ(pos_score - neg_score)"""
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, pos_score: torch.Tensor, neg_score: torch.Tensor) -> torch.Tensor:
-        diff = pos_score - neg_score
-        return -torch.mean(torch.log(torch.sigmoid(diff) + 1e-8))
-
-
-class FeedForward(nn.Module):
-    def __init__(self, d_model: int, inner_size: int, dropout: float = 0.2):
-        super().__init__()
-        self.fc1 = nn.Linear(d_model, inner_size)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(inner_size, d_model)
-        self.norm = nn.LayerNorm(d_model, eps=1e-12)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.fc1(x)
-        h = self.act(h)
-        h = self.dropout(h)
-        h = self.fc2(h)
-        h = self.dropout(h)
-        # residual + norm
-        return self.norm(h + x)
-
-
-class MambaLayer(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        d_state: int,
-        d_conv: int,
-        expand: int,
-        dropout: float,
-        use_residual: bool = True
-    ):
-        super().__init__()
-        self.mamba = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(d_model, eps=1e-12)
-        self.ffn = FeedForward(d_model, inner_size=d_model * 4, dropout=dropout)
-        self.use_residual = use_residual
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.mamba(x)
-        if self.use_residual:
-            h = self.norm(self.dropout(h) + x)
-        else:
-            h = self.norm(self.dropout(h))
-        return self.ffn(h)
