@@ -77,8 +77,9 @@ def prepare_data(config):
     test = data[data.time_idx_reversed == 0]
 
     item_count = data.item_id.max()
+    user_count = data.user_id.max()
 
-    return train, validation, validation_full, test, item_count
+    return train, validation, validation_full, test, item_count, user_count
 
 
 def create_dataloaders(train, validation, config):
@@ -108,7 +109,7 @@ def create_dataloaders(train, validation, config):
     return train_loader, eval_loader
 
 
-def create_model(config, item_count):
+def create_model(config, item_count, user_count):
 
     if hasattr(config.dataset, 'num_negatives') and config.dataset.num_negatives:
         add_head = False
@@ -127,7 +128,7 @@ def create_model(config, item_count):
         model = RNN(vocab_size=item_count + 1, add_head=add_head,
                     rnn_config=config.model_params)
     elif config.model == 'MAMBA4Rec':
-        model = MAMBA4Rec(vocab_size=int(item_count * 1.5) + 1, add_head=add_head,
+        model = MAMBA4Rec(vocab_size= user_count + item_count + 1, add_head=add_head,
                     rnn_config=config.model_params)
 
     return model

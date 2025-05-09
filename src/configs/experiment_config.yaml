@@ -1,0 +1,55 @@
+
+# @package _group_
+seed: 42
+
+data:
+  path: "dummy" # Path to data CSV or "dummy" for internal dummy data
+  item_min_count: 1 # Min interactions for an item to be kept
+  user_min_count: 1 # Min interactions for a user to be kept
+
+model:
+  name: "MAMBA4Rec"
+  max_length: 50 # Max sequence length for padding and processing
+  padding_idx: 0
+  model_params:
+    add_head: True
+    tie_weights: True
+    init_std: 0.02
+    mamba_config: # Parameters specific to the Mamba layer itself
+      d_model: 32
+      # n_layer: 1 # The Mamba class from mamba_ssm is a single block. Stacking needs custom logic.
+      d_state: 8
+      d_conv: 2
+      expand: 2
+      # Add other mamba-specific params like bias, conv_bias if needed
+
+trainer:
+  batch_size: 16 # Reduced for small dummy data
+  num_workers: 0 # For Windows, 0 is often more stable. For Linux, can be > 0.
+  learning_rate: 1.0e-3
+  max_epochs: 3 # Keep low for quick demo
+  accelerator: "auto" # "cpu", "gpu", "tpu", "mps", "auto"
+  devices: "auto" # Number of devices or "auto"
+  deterministic: True # For reproducibility
+  early_stopping:
+    enabled: True
+    monitor: "val_loss" # Metric to monitor
+    patience: 3         # Number of epochs with no improvement
+    mode: "min"         # "min" for loss/error, "max" for accuracy/NDCG
+
+evaluation:
+  top_k_metrics: [5, 10] # List of K values for metrics
+  predict_top_k_entities: 20 # How many entities model predicts before filtering for items
+
+clearml: # Optional ClearML configuration
+  project_name: "Mamba4Rec_Experiments"
+  task_name: "Default_Run"
+
+# Hydra specific settings
+hydra:
+  run:
+    dir: outputs_mamba4rec/{now:%Y-%m-%d}/{now:%H-%M-%S}
+  sweep:
+    dir: multirun_mamba4rec/{now:%Y-%m-%d}/{now:%H-%M-%S}
+    subdir: {hydra.job.num}
+

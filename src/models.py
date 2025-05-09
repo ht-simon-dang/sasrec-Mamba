@@ -4,9 +4,10 @@ Models.
 
 import numpy as np
 import torch
-import mamba
+import mamba_ssm
 from torch import nn
 from transformers import BertConfig, BertModel, GPT2Config, GPT2Model
+from mamba_ssm import Mamba
 
 
 class BERT4Rec(nn.Module):
@@ -269,6 +270,9 @@ class GPT4Rec(nn.Module):
 
         return outputs
 
+from mamba_ssm import Mamba
+import mamba_ssm
+
 class MAMBA4Rec(nn.Module):
     """
     Mamba for Sequential Recommendation.
@@ -295,7 +299,7 @@ class MAMBA4Rec(nn.Module):
                                         embedding_dim=self.hidden_size,
                                         padding_idx=padding_idx)
         
-        self.mamba_model = Mamba(**mamba_config, **kwargs)
+        self.mamba_model = mamba_ssm.Mamba(**mamba_config, **kwargs)
 
         # Optional output head
         if self.add_head:
