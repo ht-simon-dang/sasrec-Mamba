@@ -326,6 +326,7 @@ class MAMBA4Rec(nn.Module):
 
     def forward(self, input_ids, attention_mask=None):
         embeds = self.embed_layer(input_ids)
+        # use tdqm to log here every 50 sequence
         mamba_outputs = self.mamba_model(embeds)
         outputs = mamba_outputs
 

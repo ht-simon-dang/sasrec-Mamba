@@ -49,6 +49,8 @@ def filter_users(df, user_min_count, user_col='user_id'):
 
     return df
 
+## Empirial by forgetting, use user_id to avoid forget.
+## Enable DyMap, by original length
 def map_ids(df, user_col='user_id', item_col='item_id'):
     """
     item_count = 3417
