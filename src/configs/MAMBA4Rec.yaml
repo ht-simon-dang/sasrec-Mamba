@@ -8,13 +8,17 @@ dataset:
   full_negative_sampling: False
 
 dataloader:
-  batch_size: 128
-  test_batch_size: 256
-  num_workers: 8
+  batch_size: 2048
+  test_batch_size: 512
+  num_workers: 256
   validation_size: 10000
 
 model: MAMBA4Rec
 model_params:
+  input_size: 64
+  hidden_size: 64
+  num_layers: 1
+  dropout: 0.1
   maxlen: 200        
   hidden_units: 64     
   num_blocks: 2            
@@ -22,21 +26,14 @@ model_params:
   initializer_range: 0.02  
   mamba_config: # Parameters specific to the Mamba layer itself
     d_model: 32
-    # n_layer: 1 # The Mamba class from mamba_ssm is a single block. Stacking needs custom logic.
     d_state: 8
     d_conv: 2
     expand: 2
 
 seqrec_module:
-  lr: 0.001
+  lr: 0.0001
   predict_top_k: 10
   filter_seen: True
-
-# seqrec_module:
-#   lr: 0.001
-#   predict_top_k: 10  # this value is used for validation
-#   filter_seen: True
-#   # loss: bce
 
 trainer_params:
   max_epochs: 100
@@ -44,38 +41,3 @@ trainer_params:
 patience: 10
 sampled_metrics: False
 top_k_metrics: [10, 100]
-
-# ------------------------------------------------------
-# mamba4rec settings
-hidden_size: 64                 # (int) Number of features in the hidden state. 
-num_layers: 1                   # (int) Number of Mamba layers.
-dropout_prob: 0.2               # (float) Dropout rate.
-loss_type: 'CE'                 # (str) Type of loss function. Range in ['BPR', 'CE'].
-
-d_state: 32                     # (int) SSM state expansion factor
-d_conv: 4                       # (int) Local convolution width
-expand: 2                       # (int) Block expansion factor
-
-USER_ID_FIELD: user_id
-ITEM_ID_FIELD: item_id
-load_col:
-    inter: [user_id, item_id, timestamp]
-
-user_inter_num_interval: "[5,inf)"
-item_inter_num_interval: "[5,inf)"
-
-# training settings
-epochs: 300
-train_batch_size: 2048
-learner: adam
-learning_rate: 0.001
-eval_step: 1
-stopping_step: 10
-train_neg_sample_args: ~
-
-# evalution settings
-metrics: ['Hit', 'NDCG', 'MRR']
-valid_metric: NDCG@10
-eval_batch_size: 4096
-weight_decay: 0.0
-topk: [10]

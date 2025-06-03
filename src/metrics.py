@@ -7,7 +7,7 @@ import torch
 from recommenders.evaluation.python_evaluation import map_at_k, ndcg_at_k, recall_at_k
 from tqdm.auto import tqdm
 
-def compute_metrics(ground_truth, preds, k=10):
+def compute_metrics(ground_truth, preds, k=10, user_field='user_id', item_field='item_id', pred_field='prediction'):
 
     if not hasattr(ground_truth, 'rating'):
         ground_truth = ground_truth.assign(rating=1)
